@@ -1,0 +1,14 @@
+{
+  "name": "good-morning-auto-scheduler",
+  "version": "1.0.0",
+  "description": "Self-contained Node.js scheduled task that sends a 'Good morning' message at 8:00 AM Pacific Time daily",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "node-cron": "^3.0.3"
+  },
+  "author": "Jane Assistant",
+  "license": "MIT"
+}

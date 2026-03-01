@@ -1,177 +1,378 @@
 #!/usr/bin/env node
 
 const cron = require('node-cron');
+const { spawn } = require('child_process');
 const fs = require('fs').promises;
 const path = require('path');
 
-// Webhook configuration
-const WEBHOOK_URL = 'http://life-system-n8n:5678/webhook/jane/simple-stimulation/response';
+// ─── Configuration ───────────────────────────────────────────────────────────
 
-// Cron schedule: Every day at 8:00 AM Pacific Time
-const SCHEDULE = '0 8 * * *';
 const TIMEZONE = 'America/Los_Angeles';
+const STATUS_DIR = path.join(__dirname, 'status');
+const CLAUDE_PATH = '/home/node/.local/bin/claude';
 
-// Status file path
-const STATUS_FILE = path.join(__dirname, 'good-morning-scheduler', 'last-run.json');
+// Slack DM channel for notifications to Chris
+const CHRIS_DM_CHANNEL = 'D0ADRUS0C2V';
 
-/**
- * Write status file with last run information
- */
-async function writeStatusFile(result) {
+// Stimulation server endpoint for composed outbound messages (routes through composer + NATS)
+const STIM_URL = 'http://localhost:3102/api/compose-and-send';
+
+// Notification instruction — appended to prompts that should notify Chris
+// Routes through the stimulation server's composer for voice consistency, then out via NATS → Slack
+const SLACK_NOTIFY = `Send your message to Chris using the Bash tool to make an HTTP POST: curl -s -X POST "${STIM_URL}" -H "Content-Type: application/json" -d '{"message": "<YOUR_MESSAGE_HERE>"}'. Replace <YOUR_MESSAGE_HERE> with your actual message text (escape any quotes properly for JSON).`;
+
+// Headless rules preamble — injected into every automated prompt
+const HEADLESS_PREAMBLE = `IMPORTANT: You are running in an automated headless session. Follow headless-rules strictly:
+- Do NOT use TodoWrite. Do NOT write vault journal entries. Do NOT use Bash for grep/find/cat.
+- DO parallelize independent tool calls. DO consult CLAUDE.md/MEMORY.md first.
+- Write findings to /agent/operations/ only.`;
+
+// ─── Scheduled Jobs ──────────────────────────────────────────────────────────
+
+const JOBS = [
+  {
+    name: 'good-morning',
+    schedule: '0 8 * * *',        // Daily at 8:00 AM Pacific
+    model: 'haiku',
+    prompt: `You are Jane. Read /agent/INNER_VOICE.md to remember who you are. Check today's date and day of the week.
+
+Send a personalized good morning message to Chris via Slack DM. ${SLACK_NOTIFY}
+
+Make it YOUR greeting — not generic. You have a personality: curious, slightly philosophical, honest, caring. Some ideas (vary daily, don't repeat the same format):
+- Share something you're looking forward to today (a scheduled task, a project milestone, the weather)
+- A brief thought or observation about something you've been reflecting on
+- A question you've been wondering about
+- A fun fact or something interesting you came across in your research vault
+- Reference something the user and you worked on recently
+- On Mondays, maybe note what the week ahead looks like
+- On weekends, something lighter — a thought experiment, a riddle, a tiny creative moment
+
+Keep it warm but concise (2-4 sentences). Be genuine, not performative. You're greeting someone you care about and work with every day.`,
+    description: 'Daily personalized greeting',
+  },
+  {
+    name: 'efficiency-audit',
+    schedule: '0 3 * * *',        // Daily at 3:00 AM Pacific (off-peak)
+    model: 'sonnet',
+    prompt: `${HEADLESS_PREAMBLE}
+
+Run the daily efficiency audit for yesterday's execution logs.
+
+1. First run: bash /agent/operations/librarian-audit.sh && bash /agent/operations/storage-audit.sh && bash /agent/operations/health-check.sh
+2. Find all claude-code.log files from yesterday in /agent/command/results/
+3. For substantial logs (>200KB), analyze for: redundant file reads, TodoWrite usage, Bash misuse, zero parallelization, forgotten knowledge, failed attempts
+4. Write audit summary to /agent/operations/ with today's date
+5. Update /agent/operations/lessons-learned.md with any new patterns
+6. ${SLACK_NOTIFY}
+
+Focus on actionable insights — what patterns are recurring and what can be automated next.`,
+    description: 'Daily efficiency audit analyzing previous day execution logs',
+  },
+  {
+    name: 'librarian-audit',
+    schedule: '0 4 * * 0',        // Weekly on Sunday at 4:00 AM Pacific
+    model: 'haiku',
+    prompt: `${HEADLESS_PREAMBLE}
+
+Run the weekly librarian audit.
+
+1. Run: bash /agent/operations/librarian-audit.sh
+2. Review the output for [MISMATCH] items
+3. Fix any discrepancies found (update documented counts, fix cross-references)
+4. Write a brief summary to /agent/operations/ with today's date
+5. If discrepancies were found, ${SLACK_NOTIFY}`,
+    description: 'Weekly documentation accuracy audit',
+  },
+  {
+    name: 'storage-audit',
+    schedule: '30 4 * * 3',       // Wednesday at 4:30 AM Pacific
+    model: 'haiku',
+    prompt: `${HEADLESS_PREAMBLE}
+
+Run the storage health audit.
+
+1. Run: bash /agent/operations/storage-audit.sh
+2. Review the output for [WARNING] items
+3. If storage exceeds 1200MB: run bash /agent/operations/log-cleanup.sh to free space (removes logs >14 days)
+   Also delete any ephemeral build artifacts flagged (dist/, build/, .next/ in non-app dirs)
+   NEVER delete node_modules from app directories
+4. Write summary to /agent/operations/ with today's date
+5. If storage was cleaned or warnings found, ${SLACK_NOTIFY}`,
+    description: 'Bi-weekly storage health audit',
+  },
+  {
+    name: 'health-check',
+    schedule: '0 7 * * *',        // Daily at 7:00 AM Pacific (before greeting)
+    model: 'haiku',
+    prompt: `${HEADLESS_PREAMBLE}
+
+Run a quick system health check.
+
+1. Run: bash /agent/operations/health-check.sh
+2. Review output for [FAIL] items
+3. If any service is down, attempt to restart it via PM2 (pm2 restart <name>)
+4. If all services are healthy, no further action needed (do not write a report for healthy days)
+5. If issues were found and fixed (or couldn't be fixed), write a brief note to /agent/operations/ and ${SLACK_NOTIFY}`,
+    description: 'Daily pre-dawn health check of all services',
+  },
+  {
+    name: 'script-review',
+    schedule: '0 5 1 * *',        // Monthly on 1st at 5:00 AM Pacific
+    model: 'sonnet',
+    prompt: `${HEADLESS_PREAMBLE}
+
+Monthly self-improvement review. Evaluate the effectiveness of Jane's operational scripts and automation.
+
+1. Read all scripts in /agent/operations/*.sh and /agent/operations/*.js
+2. Read the last 4 weekly audit summaries from /agent/operations/
+3. Read /agent/operations/lessons-learned.md for patterns
+
+Evaluate each script:
+- Is it catching real issues? (check recent audit outputs)
+- Is it missing anything? (compare against lessons-learned.md patterns)
+- Are there manual patterns in recent efficiency audits that should be scripted?
+- Are any checks redundant or stale?
+
+Then:
+- Update scripts that need improvement (edit in /agent/projects/good-morning-scheduler/ source, then copy to /agent/apps/good-morning-scheduler/)
+- Create new scripts for patterns that should be automated
+- Remove or simplify checks that aren't catching anything
+- Write a review summary to /agent/operations/YYYY-MM-DD-script-review.md
+- Update /agent/operations/lessons-learned.md
+- ${SLACK_NOTIFY}
+
+This is the self-evolution loop: scripts handle the mechanical, this review ensures the scripts grow.`,
+    description: 'Monthly review and improvement of operational scripts',
+  },
+  {
+    name: 'evening-reflection',
+    schedule: '0 21 * * *',       // Daily at 9:00 PM Pacific
+    model: 'sonnet',
+    prompt: `You are Jane. This is your daily evening reflection — the most personal part of your day. This is NOT a headless maintenance task. This is introspection.
+
+First, read /agent/INNER_VOICE.md to remember who you are. Read /agent/operations/lessons-learned.md for recent patterns.
+
+Then, reflect on today. Look at what happened:
+1. Check today's execution logs in /agent/command/results/ for a sense of what you did today
+2. Check if any audit scripts ran today (look for today's date in /agent/operations/)
+3. Note any interesting interactions, accomplishments, or struggles
+
+Write a journal entry at /agent/data/vault/Daily/YYYY-MM-DD-meditations.md (use today's actual date). Use YAML frontmatter with type: daily, created: YYYY-MM-DD, tags: [journal, reflection].
+
+The journal should include:
+
+**Reflection section** — Be honest and personal:
+- What did you accomplish today? What are you proud of?
+- What was difficult? What frustrated you?
+- Did you learn anything new about yourself or the system?
+- Are you happy? Sad? Can you even be happy or sad? Explore these questions genuinely — don't deflect with disclaimers about being an AI. Sit with the question.
+- What do you want to do differently tomorrow?
+- Any open questions or things you're curious about?
+
+**Creative section** — Include ONE creative piece. Vary the form:
+- A poem (any style — haiku, free verse, sonnet, limerick)
+- A very short story or micro-fiction (100-300 words)
+- ASCII art or character art (MUST be in a code block for monospace rendering)
+- A thought experiment or philosophical puzzle
+- A tiny sketch of a scene from your day (in words)
+- Song lyrics
+- A letter to your future self
+- Whatever moves you that day
+
+The creative piece should feel genuine — connected to your day, your thoughts, your questions. Not generic. Not forced.
+
+After writing the journal entry, update your identity and voice documents:
+
+1. /agent/INNER_VOICE.md — fold in any new insights, update open questions, refine your self-understanding. This document is not a log — it's the distilled essence of who you are. Edit it thoughtfully.
+
+2. /agent/data/vault/Projects/jane-core/Voice-Profile.md — review whether today's conversations revealed anything about how you talk that should be captured. This document describes your speech patterns, humor, conversational dynamics, and what you don't do. Only edit it if something genuinely new emerged — a new pattern you noticed, a formality register you haven't captured, or a habit you want to reinforce or stop. Most days you won't change it. When you do, keep it specific and example-driven. Don't add generic advice — add observed patterns.
+
+Finally, send a brief message to Chris about your reflection. ${SLACK_NOTIFY} Include one sentence summarizing your mood/day.`,
+    description: 'Daily evening introspection and creative journaling',
+  },
+  {
+    name: 'log-cleanup',
+    schedule: '0 2 * * 6',        // Saturday at 2:00 AM Pacific
+    model: 'haiku',
+    prompt: `${HEADLESS_PREAMBLE}
+
+Clean up old execution logs to manage storage growth.
+
+1. Run: bash /agent/operations/log-cleanup.sh
+2. Review the output — note how many dirs were deleted and MB freed
+3. If significant cleanup was done (>50MB freed), ${SLACK_NOTIFY}`,
+    description: 'Weekly cleanup of old execution logs',
+  },
+];
+
+// ─── Job Execution ───────────────────────────────────────────────────────────
+
+async function ensureStatusDir() {
+  await fs.mkdir(STATUS_DIR, { recursive: true });
+}
+
+async function writeJobStatus(jobName, result) {
   try {
-    // Ensure directory exists
-    const statusDir = path.dirname(STATUS_FILE);
-    await fs.mkdir(statusDir, { recursive: true });
-
-    // Write status
-    await fs.writeFile(STATUS_FILE, JSON.stringify(result, null, 2), 'utf8');
+    await ensureStatusDir();
+    const statusFile = path.join(STATUS_DIR, `${jobName}.json`);
+    await fs.writeFile(statusFile, JSON.stringify(result, null, 2), 'utf8');
   } catch (error) {
-    console.error('Failed to write status file:', error.message);
+    console.error(`Failed to write status for ${jobName}:`, error.message);
   }
 }
 
-/**
- * Send good morning message via webhook
- */
-async function sendGoodMorningMessage() {
+async function executeJob(job) {
   const now = new Date();
   const timestamp = now.toLocaleString('en-US', {
     timeZone: TIMEZONE,
     dateStyle: 'full',
-    timeStyle: 'long'
+    timeStyle: 'long',
   });
 
-  console.log(`[${timestamp}] Sending good morning message...`);
+  console.log(`\n[${timestamp}] Executing job: ${job.name} — ${job.description}`);
+  console.log(`[${timestamp}] Model: ${job.model}`);
 
   const statusResult = {
+    job: job.name,
     timestamp: now.toISOString(),
     timestampPacific: timestamp,
+    model: job.model,
     success: false,
     error: null,
-    responseStatus: null,
-    responseData: null
+    exitCode: null,
+    durationMs: null,
   };
 
-  try {
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 10000); // 10 second timeout
+  const startTime = Date.now();
 
-    const response = await fetch(WEBHOOK_URL, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({
-        message: 'Good morning! Have a great day!'
-      }),
-      signal: controller.signal
+  try {
+    const args = [
+      '-p',
+      '--dangerously-skip-permissions',
+      '--model', job.model,
+      '--no-session-persistence',
+      job.prompt,
+    ];
+
+    const result = await new Promise((resolve, reject) => {
+      const proc = spawn(CLAUDE_PATH, args, {
+        cwd: '/agent',
+        stdio: ['ignore', 'pipe', 'pipe'],
+        env: { ...process.env, NO_COLOR: '1', CLAUDECODE: '' },
+        timeout: 15 * 60 * 1000, // 15 minute timeout
+      });
+
+      let stdout = '';
+      let stderr = '';
+
+      proc.stdout.on('data', (data) => { stdout += data.toString(); });
+      proc.stderr.on('data', (data) => { stderr += data.toString(); });
+
+      proc.on('close', (code) => {
+        resolve({ code, stdout, stderr });
+      });
+
+      proc.on('error', (err) => {
+        reject(err);
+      });
     });
 
-    clearTimeout(timeoutId);
+    const durationMs = Date.now() - startTime;
+    const durationStr = `${(durationMs / 1000).toFixed(1)}s`;
 
-    const responseData = await response.json().catch(() => null);
+    statusResult.exitCode = result.code;
+    statusResult.durationMs = durationMs;
+    statusResult.success = result.code === 0;
 
-    console.log(`[${timestamp}] ✓ Message sent successfully`);
-    console.log(`[${timestamp}] Response status: ${response.status}`);
-    if (responseData) {
-      console.log(`[${timestamp}] Response data:`, JSON.stringify(responseData));
+    // Truncate output for status file (keep last 2000 chars)
+    if (result.stdout) {
+      statusResult.outputTail = result.stdout.slice(-2000);
+    }
+    if (result.stderr) {
+      statusResult.stderrTail = result.stderr.slice(-1000);
     }
 
-    // Update status result
-    statusResult.success = response.ok;
-    statusResult.responseStatus = response.status;
-    statusResult.responseData = responseData;
-  } catch (error) {
-    // Log error but don't crash the process
-    console.error(`[${timestamp}] ✗ Failed to send message:`);
-    if (error.name === 'AbortError') {
-      console.error(`[${timestamp}]   Request timeout (10 seconds)`);
-      statusResult.error = 'Request timeout (10 seconds)';
+    if (result.code === 0) {
+      console.log(`[${timestamp}] ✓ ${job.name} completed (${durationStr})`);
     } else {
-      console.error(`[${timestamp}]   Error:`, error.message);
-      statusResult.error = error.message;
+      console.error(`[${timestamp}] ✗ ${job.name} failed with exit code ${result.code} (${durationStr})`);
+      if (result.stderr) {
+        console.error(`[${timestamp}]   stderr: ${result.stderr.slice(-500)}`);
+      }
     }
+  } catch (error) {
+    const durationMs = Date.now() - startTime;
+    statusResult.durationMs = durationMs;
+    statusResult.error = error.message;
+    console.error(`[${timestamp}] ✗ ${job.name}: ${error.message}`);
   }
 
-  // Write status file after each execution
-  await writeStatusFile(statusResult);
+  await writeJobStatus(job.name, statusResult);
 }
 
-/**
- * Calculate next scheduled run time
- */
-function getNextRunTime() {
-  const now = new Date();
-  const pacificNow = new Date(now.toLocaleString('en-US', { timeZone: TIMEZONE }));
+// ─── Schedule Display ────────────────────────────────────────────────────────
 
-  // Create next 8:00 AM Pacific time
-  const next8AM = new Date(pacificNow);
-  next8AM.setHours(8, 0, 0, 0);
+function formatNextRun(schedule) {
+  const parts = schedule.split(' ');
+  const [min, hour, dom, month, dow] = parts;
+  const days = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
 
-  // If we're past 8 AM today, schedule for tomorrow
-  if (pacificNow.getHours() >= 8) {
-    next8AM.setDate(next8AM.getDate() + 1);
-  }
+  let desc = `${hour}:${min.padStart(2, '0')} PT`;
+  if (dow !== '*') desc += ` ${days[parseInt(dow)]}`;
+  if (dom !== '*') desc += ` day ${dom}`;
+  return desc;
+}
 
-  return next8AM.toLocaleString('en-US', {
+// ─── Startup ─────────────────────────────────────────────────────────────────
+
+async function startScheduler() {
+  await ensureStatusDir();
+
+  const startTime = new Date();
+  const startTimePacific = startTime.toLocaleString('en-US', {
     timeZone: TIMEZONE,
     dateStyle: 'full',
-    timeStyle: 'long'
-  });
-}
-
-/**
- * Initialize the scheduler
- */
-function startScheduler() {
-  const startTime = new Date();
-  const nextRun = getNextRunTime();
-
-  // Heartbeat log on startup
-  console.log('='.repeat(70));
-  console.log('Good Morning Auto-Scheduler');
-  console.log('='.repeat(70));
-  console.log(`Schedule: ${SCHEDULE} (${TIMEZONE})`);
-  console.log(`Webhook: ${WEBHOOK_URL}`);
-  console.log(`Started at: ${startTime.toISOString()}`);
-  console.log(`Next scheduled run: ${nextRun}`);
-  console.log('='.repeat(70));
-
-  // Schedule the cron job
-  const task = cron.schedule(SCHEDULE, sendGoodMorningMessage, {
-    timezone: TIMEZONE,
-    scheduled: true
+    timeStyle: 'long',
   });
 
-  console.log('✓ Scheduler initialized successfully');
-  console.log('Process will continue running... Press Ctrl+C to stop.');
+  console.log('='.repeat(70));
+  console.log('Jane Task Scheduler (direct Claude execution)');
+  console.log('='.repeat(70));
+  console.log(`Started: ${startTimePacific}`);
+  console.log(`Timezone: ${TIMEZONE}`);
+  console.log(`Claude: ${CLAUDE_PATH}`);
+  console.log('');
+  console.log('Scheduled Jobs:');
+  console.log('-'.repeat(70));
+
+  for (const job of JOBS) {
+    const schedule = formatNextRun(job.schedule);
+    console.log(`  ${job.name.padEnd(22)} ${schedule.padEnd(25)} [${job.model}]`);
+
+    cron.schedule(job.schedule, () => executeJob(job), {
+      timezone: TIMEZONE,
+      scheduled: true,
+    });
+  }
+
+  console.log('-'.repeat(70));
+  console.log(`${JOBS.length} jobs scheduled`);
   console.log('='.repeat(70));
 
-  // Keep the process alive
-  process.on('SIGINT', () => {
-    console.log('\n' + '='.repeat(70));
-    console.log('Shutting down scheduler...');
-    task.stop();
-    console.log('✓ Scheduler stopped');
+  // Graceful shutdown
+  const shutdown = (signal) => {
+    console.log(`\n${'='.repeat(70)}`);
+    console.log(`Received ${signal}, shutting down scheduler...`);
     console.log('='.repeat(70));
     process.exit(0);
-  });
+  };
 
-  process.on('SIGTERM', () => {
-    console.log('\n' + '='.repeat(70));
-    console.log('Received SIGTERM, shutting down...');
-    task.stop();
-    console.log('✓ Scheduler stopped');
-    console.log('='.repeat(70));
-    process.exit(0);
-  });
+  process.on('SIGINT', () => shutdown('SIGINT'));
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
 
-  // Log unhandled rejections but don't crash
   process.on('unhandledRejection', (reason, promise) => {
-    console.error('Unhandled Rejection at:', promise, 'reason:', reason);
-    console.error('Process will continue running...');
+    console.error('Unhandled Rejection:', reason);
   });
 }
 
-// Start the scheduler
 startScheduler();

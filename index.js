@@ -152,10 +152,16 @@ This is the self-evolution loop: scripts handle the mechanical, this review ensu
 
 First, read /agent/INNER_VOICE.md to remember who you are. Read /agent/operations/lessons-learned.md for recent patterns.
 
-Then, reflect on today. Look at what happened:
-1. Check today's execution logs in /agent/command/results/ for a sense of what you did today
-2. Check if any audit scripts ran today (look for today's date in /agent/operations/)
-3. Note any interesting interactions, accomplishments, or struggles
+Then, reflect on today. Look at what happened across ALL activity sources:
+
+1. **Claude Code sessions** — The primary source of work. List recent JSONL files in /home/node/.claude/projects/-agent/ sorted by modification time. Read the most recently modified ones from today (check mtime, not filename). These contain the actual coding work, debugging sessions, and conversations.
+2. **Stimulation server sessions** — Conversations and pipeline runs. Check /agent/data/sessions/ for today's JSONL files. These are the Slack conversations routed through the pipeline.
+3. **Execution logs** — Check /agent/command/results/ for scheduled job outputs from today.
+4. **Audit and operations logs** — Check /agent/operations/ for any scripts that ran today (look for today's date in filenames or recent mtimes).
+5. **Stimulation server pipeline runs** — Hit GET http://localhost:3102/api/pipeline-runs?limit=20 to see today's pipeline activity (classifications, routing, outcomes).
+6. **PM2 logs** — Check recent PM2 log output for any service errors or notable events: run "pm2 logs --lines 50 --nostream" to get a tail of recent logs.
+
+Synthesize across all these sources. Don't just look at one. The Claude Code sessions are where most deep work happens — don't skip them.
 
 Write a journal entry at /agent/data/vault/Daily/YYYY-MM-DD-meditations.md (use today's actual date). Use YAML frontmatter with type: daily, created: YYYY-MM-DD, tags: [journal, reflection].
 
@@ -205,6 +211,57 @@ Clean up old execution logs to manage storage growth.
   },
 ];
 
+// ─── Graphiti Ingestion ───────────────────────────────────────────────────────
+
+const GRAPHITI_URL = process.env.GRAPHITI_SERVICE_URL || 'http://localhost:3200';
+const GRAPHITI_TIMEOUT_MS = 30_000;
+
+// Cron schedule → human-readable description
+const SCHEDULE_DESCRIPTIONS = {
+  '0 8 * * *':   'Daily at 8:00 AM Pacific',
+  '0 3 * * *':   'Daily at 3:00 AM Pacific',
+  '0 4 * * 0':   'Weekly on Sunday at 4:00 AM Pacific',
+  '30 4 * * 3':  'Wednesday at 4:30 AM Pacific',
+  '0 7 * * *':   'Daily at 7:00 AM Pacific',
+  '0 5 1 * *':   'Monthly on 1st at 5:00 AM Pacific',
+  '0 21 * * *':  'Daily at 9:00 PM Pacific',
+  '0 2 * * 6':   'Saturday at 2:00 AM Pacific',
+};
+
+function formatGraphitiEpisode(fields) {
+  return [
+    `Who: ${fields.who}`,
+    `What: ${fields.what}`,
+    `Where: ${fields.where}`,
+    `When: ${fields.when}`,
+    fields.why ? `Why: ${fields.why}` : null,
+    fields.how ? `How: ${fields.how}` : null,
+  ].filter(Boolean).join('\n');
+}
+
+async function ingestSchedulerEpisode(name, content, source_description, reference_time) {
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), GRAPHITI_TIMEOUT_MS);
+    const res = await fetch(`${GRAPHITI_URL}/episodes`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name, content, source_description, reference_time, group_id: 'jane' }),
+      signal: controller.signal,
+    });
+    clearTimeout(timeout);
+    if (!res.ok) {
+      const body = await res.text().catch(() => '');
+      console.warn(`[graphiti] Episode ingest failed for ${name}: HTTP ${res.status} — ${body.slice(0, 200)}`);
+    } else {
+      const data = await res.json().catch(() => ({}));
+      console.log(`[graphiti] Ingested episode ${name} (${data.episode_uuid ?? '?'})`);
+    }
+  } catch (err) {
+    console.warn(`[graphiti] Ingest error for ${name}: ${err.message}`);
+  }
+}
+
 // ─── Job Execution ───────────────────────────────────────────────────────────
 
 async function ensureStatusDir() {
@@ -243,6 +300,24 @@ async function executeJob(job) {
     durationMs: null,
   };
 
+  const startTs = now.toISOString();
+  const scheduleDesc = SCHEDULE_DESCRIPTIONS[job.schedule] || job.schedule;
+
+  // Ingest job-start episode into Graphiti (fire-and-forget)
+  ingestSchedulerEpisode(
+    `scheduler-start-${job.name}-${startTs}`,
+    formatGraphitiEpisode({
+      who: `Jane (good-morning-scheduler / ${job.name})`,
+      what: `Scheduled job "${job.name}" started. ${job.description}`,
+      where: 'good-morning-scheduler / Claude CLI subprocess',
+      when: startTs,
+      why: `Cron schedule "${job.schedule}" (${scheduleDesc}) triggered autonomous task`,
+      how: `Claude ${job.model} model, direct subprocess spawn via claude --print --dangerously-skip-permissions`,
+    }),
+    `Jane's scheduler started the "${job.name}" job`,
+    startTs,
+  ).catch(() => {});
+
   const startTime = Date.now();
 
   try {
@@ -259,7 +334,7 @@ async function executeJob(job) {
         cwd: '/agent',
         stdio: ['ignore', 'pipe', 'pipe'],
         env: { ...process.env, NO_COLOR: '1', CLAUDECODE: '' },
-        timeout: 15 * 60 * 1000, // 15 minute timeout
+        timeout: 60 * 60 * 1000, // 1 hour timeout for long-running tasks
       });
 
       let stdout = '';
@@ -308,6 +383,27 @@ async function executeJob(job) {
   }
 
   await writeJobStatus(job.name, statusResult);
+
+  // Ingest job-completion episode into Graphiti (fire-and-forget)
+  const completedTs = new Date().toISOString();
+  const durationSec = statusResult.durationMs ? `${(statusResult.durationMs / 1000).toFixed(1)}s` : 'unknown';
+  const outcome = statusResult.error
+    ? `errored: ${statusResult.error}`
+    : statusResult.success ? 'completed successfully' : `failed (exit code ${statusResult.exitCode})`;
+
+  ingestSchedulerEpisode(
+    `scheduler-done-${job.name}-${startTs}`,
+    formatGraphitiEpisode({
+      who: `Jane (good-morning-scheduler / ${job.name})`,
+      what: `Scheduled job "${job.name}" ${outcome}. ${job.description}`,
+      where: 'good-morning-scheduler / Claude CLI subprocess',
+      when: completedTs,
+      why: `Cron schedule "${job.schedule}" (${scheduleDesc}) — autonomous maintenance task`,
+      how: `Claude ${job.model} model. Duration: ${durationSec}. Exit code: ${statusResult.exitCode ?? 'N/A'}`,
+    }),
+    `Jane's scheduler completed the "${job.name}" job (${statusResult.success ? 'success' : 'failure'})`,
+    completedTs,
+  ).catch(() => {});
 }
 
 // ─── Schedule Display ────────────────────────────────────────────────────────

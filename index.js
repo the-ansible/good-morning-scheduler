@@ -1,7 +1,6 @@
 #!/usr/bin/env node
 
 const cron = require('node-cron');
-const { spawn } = require('child_process');
 const fs = require('fs').promises;
 const path = require('path');
 
@@ -9,7 +8,16 @@ const path = require('path');
 
 const TIMEZONE = 'America/Los_Angeles';
 const STATUS_DIR = path.join(__dirname, 'status');
-const CLAUDE_PATH = '/home/node/.local/bin/claude';
+
+// Dynamic import for ESM launcher module (loaded once at first use)
+let _launchClaude = null;
+async function getLauncher() {
+  if (!_launchClaude) {
+    const mod = await import('@jane-core/claude-launcher');
+    _launchClaude = mod.launchClaude;
+  }
+  return _launchClaude;
+}
 
 // Slack DM channel for notifications to Chris
 const CHRIS_DM_CHANNEL = 'D0ADRUS0C2V';
@@ -19,7 +27,8 @@ const STIM_URL = 'http://localhost:3102/api/compose-and-send';
 
 // Notification instruction — appended to prompts that should notify Chris
 // Routes through the stimulation server's composer for voice consistency, then out via NATS → Slack
-const SLACK_NOTIFY = `Send your message to Chris using the Bash tool to make an HTTP POST: curl -s -X POST "${STIM_URL}" -H "Content-Type: application/json" -d '{"message": "<YOUR_MESSAGE_HERE>"}'. Replace <YOUR_MESSAGE_HERE> with your actual message text (escape any quotes properly for JSON).`;
+// Includes sender identity so messages are correctly attributed in the knowledge graph
+const SLACK_NOTIFY = `Send your message to Chris using the Bash tool to make an HTTP POST: curl -s -X POST "${STIM_URL}" -H "Content-Type: application/json" -d '{"message": "<YOUR_MESSAGE_HERE>", "sender": {"id": "jane-scheduler", "displayName": "Jane (Scheduler)", "type": "agent"}}'. Replace <YOUR_MESSAGE_HERE> with your actual message text (escape any quotes properly for JSON).`;
 
 // Headless rules preamble — injected into every automated prompt
 const HEADLESS_PREAMBLE = `IMPORTANT: You are running in an automated headless session. Follow headless-rules strictly:
@@ -321,58 +330,40 @@ async function executeJob(job) {
   const startTime = Date.now();
 
   try {
-    const args = [
-      '-p',
-      '--dangerously-skip-permissions',
-      '--model', job.model,
-      '--no-session-persistence',
-      job.prompt,
-    ];
+    const launchClaude = await getLauncher();
+    let stderrBuf = '';
 
-    const result = await new Promise((resolve, reject) => {
-      const proc = spawn(CLAUDE_PATH, args, {
-        cwd: '/agent',
-        stdio: ['ignore', 'pipe', 'pipe'],
-        env: { ...process.env, NO_COLOR: '1', CLAUDECODE: '' },
-        timeout: 60 * 60 * 1000, // 1 hour timeout for long-running tasks
-      });
-
-      let stdout = '';
-      let stderr = '';
-
-      proc.stdout.on('data', (data) => { stdout += data.toString(); });
-      proc.stderr.on('data', (data) => { stderr += data.toString(); });
-
-      proc.on('close', (code) => {
-        resolve({ code, stdout, stderr });
-      });
-
-      proc.on('error', (err) => {
-        reject(err);
-      });
+    const result = await launchClaude({
+      model: job.model,
+      prompt: job.prompt,
+      promptVia: 'arg',
+      outputFormat: 'text',
+      timeout: 60 * 60 * 1000, // 1 hour
+      additionalArgs: ['--no-session-persistence'],
+      onStderr: (chunk) => { stderrBuf += chunk; },
     });
 
     const durationMs = Date.now() - startTime;
     const durationStr = `${(durationMs / 1000).toFixed(1)}s`;
 
-    statusResult.exitCode = result.code;
+    statusResult.exitCode = result.exitCode;
     statusResult.durationMs = durationMs;
-    statusResult.success = result.code === 0;
+    statusResult.success = result.exitCode === 0;
 
     // Truncate output for status file (keep last 2000 chars)
     if (result.stdout) {
       statusResult.outputTail = result.stdout.slice(-2000);
     }
-    if (result.stderr) {
-      statusResult.stderrTail = result.stderr.slice(-1000);
+    if (stderrBuf) {
+      statusResult.stderrTail = stderrBuf.slice(-1000);
     }
 
-    if (result.code === 0) {
+    if (result.exitCode === 0) {
       console.log(`[${timestamp}] ✓ ${job.name} completed (${durationStr})`);
     } else {
-      console.error(`[${timestamp}] ✗ ${job.name} failed with exit code ${result.code} (${durationStr})`);
-      if (result.stderr) {
-        console.error(`[${timestamp}]   stderr: ${result.stderr.slice(-500)}`);
+      console.error(`[${timestamp}] ✗ ${job.name} failed with exit code ${result.exitCode} (${durationStr})`);
+      if (stderrBuf) {
+        console.error(`[${timestamp}]   stderr: ${stderrBuf.slice(-500)}`);
       }
     }
   } catch (error) {
@@ -436,7 +427,7 @@ async function startScheduler() {
   console.log('='.repeat(70));
   console.log(`Started: ${startTimePacific}`);
   console.log(`Timezone: ${TIMEZONE}`);
-  console.log(`Claude: ${CLAUDE_PATH}`);
+  console.log(`Claude: @jane-core/claude-launcher`);
   console.log('');
   console.log('Scheduled Jobs:');
   console.log('-'.repeat(70));

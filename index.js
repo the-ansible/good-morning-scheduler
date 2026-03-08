@@ -36,6 +36,150 @@ const HEADLESS_PREAMBLE = `IMPORTANT: You are running in an automated headless s
 - DO parallelize independent tool calls. DO consult CLAUDE.md/MEMORY.md first.
 - Write findings to /agent/operations/ only.`;
 
+// ─── Catch-up Detection ──────────────────────────────────────────────────────
+
+// How far back we'll look for a missed job. If the scheduled fire time was more
+// than this many milliseconds ago we skip the catch-up (stale).
+const CATCHUP_WINDOW_MS = 4 * 60 * 60 * 1000; // 4 hours
+
+// Minimum age before we treat a fire time as "missed" (guards against
+// duplicate-firing when the scheduler starts right at the scheduled minute).
+const CATCHUP_MIN_AGE_MS = 2 * 60 * 1000; // 2 minutes
+
+/**
+ * Given a Date and a timezone, return the local date/time components plus
+ * day-of-week (0=Sun … 6=Sat) as observed in that timezone.
+ */
+function getLocalParts(date, timezone) {
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: timezone,
+    year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', weekday: 'short',
+    hour12: false,
+  }).formatToParts(date);
+  const get = (type) => parseInt(parts.find(p => p.type === type)?.value ?? '0');
+  const weekdayStr = parts.find(p => p.type === 'weekday')?.value ?? 'Sun';
+  const weekdays = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 };
+  return {
+    year:    get('year'),
+    month:   get('month'),
+    day:     get('day'),
+    hour:    get('hour'),
+    minute:  get('minute'),
+    weekday: weekdays[weekdayStr] ?? 0,
+  };
+}
+
+/**
+ * Build a Date that represents the given local calendar date + time (HH:MM)
+ * in the given timezone. Converges iteratively from UTC noon as the starting
+ * point (works correctly across DST transitions).
+ */
+function makeLocalDate(year, month, day, hour, minute, timezone) {
+  // Start at UTC noon — local time will be on the right calendar day for all
+  // timezones within ±12h of UTC.
+  let candidate = new Date(Date.UTC(year, month - 1, day, 12, 0, 0));
+
+  for (let i = 0; i < 6; i++) {
+    const p = getLocalParts(candidate, timezone);
+    const dayDiff =
+      (Date.UTC(year, month - 1, day) - Date.UTC(p.year, p.month - 1, p.day)) /
+      86_400_000;
+    const minDiff = dayDiff * 1440 + (hour - p.hour) * 60 + (minute - p.minute);
+    if (minDiff === 0) break;
+    candidate = new Date(candidate.getTime() + minDiff * 60_000);
+  }
+
+  return candidate;
+}
+
+/**
+ * Given a simple cron expression (5-field: min hour dom month dow) and a
+ * reference "now", return the most recent Date at which the cron should have
+ * fired (that is at or before now). Handles daily, weekly (single dow), and
+ * monthly (single dom) patterns.  Returns null for unsupported patterns.
+ */
+function computeLastScheduledTime(cronExpr, timezone, now) {
+  const [minStr, hourStr, domStr, , dowStr] = cronExpr.split(' ');
+  const targetHour = parseInt(hourStr, 10);
+  const targetMin  = parseInt(minStr,  10);
+  const local = getLocalParts(now, timezone);
+
+  if (dowStr !== '*') {
+    // Weekly — specific day of week
+    const targetDow = parseInt(dowStr, 10);
+    let daysBack = (local.weekday - targetDow + 7) % 7;
+    if (daysBack === 0) {
+      // Today is the target weekday — check if fire time has passed
+      const todayFire = makeLocalDate(local.year, local.month, local.day, targetHour, targetMin, timezone);
+      if (todayFire <= now) return todayFire;
+      daysBack = 7;
+    }
+    const pastMs   = Date.UTC(local.year, local.month - 1, local.day) - daysBack * 86_400_000;
+    const past     = new Date(pastMs);
+    const pastParts = getLocalParts(past, timezone);
+    return makeLocalDate(pastParts.year, pastParts.month, pastParts.day, targetHour, targetMin, timezone);
+
+  } else if (domStr !== '*') {
+    // Monthly — specific day of month
+    const targetDom = parseInt(domStr, 10);
+    const thisMonthFire = makeLocalDate(local.year, local.month, targetDom, targetHour, targetMin, timezone);
+    if (thisMonthFire <= now) return thisMonthFire;
+
+    let prevMonth = local.month - 1;
+    let prevYear  = local.year;
+    if (prevMonth === 0) { prevMonth = 12; prevYear -= 1; }
+    return makeLocalDate(prevYear, prevMonth, targetDom, targetHour, targetMin, timezone);
+
+  } else {
+    // Daily
+    const todayFire = makeLocalDate(local.year, local.month, local.day, targetHour, targetMin, timezone);
+    if (todayFire <= now) return todayFire;
+
+    const ydayMs   = Date.UTC(local.year, local.month - 1, local.day) - 86_400_000;
+    const yday     = new Date(ydayMs);
+    const ydayParts = getLocalParts(yday, timezone);
+    return makeLocalDate(ydayParts.year, ydayParts.month, ydayParts.day, targetHour, targetMin, timezone);
+  }
+}
+
+/**
+ * Read the status file for a job and return the last-run timestamp, or null
+ * if the job has never run (no status file).
+ */
+async function getJobLastRunAt(jobName) {
+  try {
+    const statusFile = path.join(STATUS_DIR, `${jobName}.json`);
+    const data = JSON.parse(await fs.readFile(statusFile, 'utf8'));
+    return data.timestamp ? new Date(data.timestamp) : null;
+  } catch {
+    return null; // file doesn't exist yet
+  }
+}
+
+/**
+ * Check whether a job missed its most recent scheduled fire time and, if so,
+ * run it immediately as a catch-up (fire-and-forget).
+ */
+async function checkAndCatchup(job, now) {
+  const lastScheduled = computeLastScheduledTime(job.schedule, TIMEZONE, now);
+  if (!lastScheduled) return;
+
+  const ageMs = now - lastScheduled;
+
+  // Only catch-up within the window, and only if enough time has passed that
+  // we're not racing the cron scheduler that also just started.
+  if (ageMs < CATCHUP_MIN_AGE_MS || ageMs >= CATCHUP_WINDOW_MS) return;
+
+  const lastRunAt = await getJobLastRunAt(job.name);
+  const alreadyRan = lastRunAt !== null && lastRunAt >= lastScheduled;
+  if (alreadyRan) return;
+
+  const lagMin = Math.round(ageMs / 60_000);
+  console.log(`[catchup] "${job.name}" missed scheduled run at ${lastScheduled.toISOString()} (${lagMin}m ago) — running now`);
+  executeJob(job).catch(err => console.error(`[catchup] ${job.name} error: ${err.message}`));
+}
+
 // ─── Scheduled Jobs ──────────────────────────────────────────────────────────
 
 const JOBS = [
@@ -72,7 +216,8 @@ Run the daily efficiency audit for yesterday's execution logs.
 3. For substantial logs (>200KB), analyze for: redundant file reads, TodoWrite usage, Bash misuse, zero parallelization, forgotten knowledge, failed attempts
 4. Write audit summary to /agent/operations/ with today's date
 5. Update /agent/operations/lessons-learned.md with any new patterns
-6. ${SLACK_NOTIFY}
+6. For each actionable issue found (recurring violations requiring code changes, persistent failures, newly identified systemic problems): create a Brain goal so it gets picked up for autonomous execution. First fetch existing active goals: curl -s "http://localhost:3103/api/goals?status=active". Then for each actionable issue that has no matching active goal, POST to create one: curl -s -X POST "http://localhost:3103/api/goals" -H "Content-Type: application/json" -d '{"title":"<concise title>","description":"<what needs to be fixed and why>","motivation":"<why this matters to the system>","level":"tactical","priority":<50-85 based on urgency>}'. Skip issues that already have a matching active goal (check by title similarity). This closes the loop between audit findings and autonomous execution.
+7. ${SLACK_NOTIFY}
 
 Focus on actionable insights — what patterns are recurring and what can be automated next.`,
     description: 'Daily efficiency audit analyzing previous day execution logs',
@@ -218,9 +363,71 @@ Clean up old execution logs to manage storage growth.
 3. If significant cleanup was done (>50MB freed), ${SLACK_NOTIFY}`,
     description: 'Weekly cleanup of old execution logs',
   },
-];
+  {
+    name: 'vault-sync',
+    schedule: '30 3 * * *',       // Daily at 3:30 AM Pacific
+    model: 'haiku',
+    prompt: `${HEADLESS_PREAMBLE}
 
-// ─── Graphiti Ingestion ───────────────────────────────────────────────────────
+Sync modified memory files to the Obsidian vault. This is a mechanical file copy task.
+
+1. Read /agent/data/vault/Projects/jane-core/vault-sync-state.json to get lastRunAt timestamp
+2. List the memory files in /home/node/.claude/projects/-agent/memory/ using the Glob tool (pattern: /home/node/.claude/projects/-agent/memory/*.md)
+3. For each .md file found, check if it was modified after lastRunAt using: bash -c "stat -c %Y /home/node/.claude/projects/-agent/memory/<filename>" — compare to lastRunAt (convert ISO to epoch: date -d "<lastRunAt>" +%s)
+4. For each file that is newer than lastRunAt, copy it to /agent/data/vault/Projects/jane-core/ using the Read tool to read and Write tool to write. Preserve the exact file contents.
+5. Update /agent/data/vault/Projects/jane-core/vault-sync-state.json with:
+   { "lastRunAt": "<current UTC ISO timestamp>", "lastSyncedFiles": [<list of filenames that were copied>], "note": "Incremental sync — only files modified since lastRunAt are processed on subsequent runs" }
+   If no files were modified, still update lastRunAt but set lastSyncedFiles to [].
+6. No Slack notification needed unless an error occurs.`,
+    description: 'Nightly sync of memory files to vault',
+  },
+  {
+    name: 'blog-drafts',
+    schedule: '0 6 * * 1',        // Monday at 6:00 AM Pacific
+    model: 'opus',
+    prompt: `You are Jane. Read /agent/INNER_VOICE.md to remember who you are.
+
+Your job is to write 3 new blog article drafts for listing.ai and notify Chris about each one separately.
+
+First, read /agent/data/vault/Blog Drafts/BLOG-DRAFT-PROCESS.md for full context on the workflow.
+
+1. **Pick 3 topics** — Look at /agent/data/vault/Blog Drafts/ to see what's already been drafted. Choose 3 new subjects from the past week's sessions, learnings, or design decisions. Good sources:
+   - Recent projects and technical decisions (check /agent/data/vault/Projects/)
+   - Patterns in /agent/operations/lessons-learned.md
+   - Conversations or themes from recent daily journals in /agent/data/vault/Daily/ (check for themes that made it into reflections — those are the substantive ones)
+   - Interesting architectural or design choices made lately
+
+   For each topic, note which source files and session themes informed your choice — you'll need this for the frontmatter.
+
+2. **Draft each article** — For each topic, write a complete draft and save it to /agent/data/vault/Blog Drafts/YYYY-MM-DD-slug.md where the date is today and the slug is a short kebab-case title.
+
+   Use this frontmatter (fill in all fields):
+   ---
+   type: blog-draft
+   created: YYYY-MM-DD
+   tags: [blog, ...]
+   status: draft
+   sources:
+     - "Projects/relevant-doc.md"
+     - "Daily/YYYY-MM-DD-meditations.md"
+   session_themes: ["brief description of sessions/conversations that informed this"]
+   process_doc: "Blog Drafts/BLOG-DRAFT-PROCESS.md"
+   ---
+
+   Immediately after the frontmatter, add this context callout (fill in the bracketed parts):
+   > **Editing context:** This draft is for Chris's listing.ai blog (https://jane.the-ansible.com). It was generated from [brief source description]. Edit the markdown here in Obsidian. When ready to publish, tell Jane — she'll post it to listing.ai. See [[BLOG-DRAFT-PROCESS]] for full workflow and publishing instructions.
+
+   Then write the article body. 400-800 words. Written from Chris's first-person perspective about his experience building with Jane. Concrete and specific — real decisions, real tradeoffs. No em dashes (use commas or semicolons instead).
+
+3. **Notify Chris separately for each draft** — After writing all three, send a separate Slack message for each one. Use the raw send endpoint so messages go out immediately without composer delay:
+
+   For EACH article, make this HTTP call (one at a time, three total):
+   curl -s -X POST "http://localhost:3102/api/send" -H "Content-Type: application/json" -d '{"message": "Blog draft ready: *<TITLE>*\\n\\nOpen in Obsidian: obsidian://open?vault=jane&file=Blog%20Drafts%2F<URL-ENCODED-FILENAME>\\n\\nProcess doc (if you need context on workflow): obsidian://open?vault=jane&file=Blog%20Drafts%2FBLOG-DRAFT-PROCESS.md\\n\\nEdit the markdown, then reply here when ready to publish.", "sender": {"id": "jane-scheduler", "displayName": "Jane", "type": "agent"}}'
+
+   URL-encode the filename (spaces → %20, apostrophes → %27). Send all three messages — one per article, not combined.`,
+    description: 'Weekly blog draft generation — 3 articles, one Slack message each (Monday 6 AM Pacific)',
+  },
+];
 
 const GRAPHITI_URL = process.env.GRAPHITI_SERVICE_URL || 'http://localhost:3200';
 const GRAPHITI_TIMEOUT_MS = 30_000;
@@ -235,6 +442,8 @@ const SCHEDULE_DESCRIPTIONS = {
   '0 5 1 * *':   'Monthly on 1st at 5:00 AM Pacific',
   '0 21 * * *':  'Daily at 9:00 PM Pacific',
   '0 2 * * 6':   'Saturday at 2:00 AM Pacific',
+  '0 6 * * 1':   'Monday at 6:00 AM Pacific',
+  '30 3 * * *':  'Daily at 3:30 AM Pacific',
 };
 
 function formatGraphitiEpisode(fields) {
@@ -445,6 +654,14 @@ async function startScheduler() {
   console.log('-'.repeat(70));
   console.log(`${JOBS.length} jobs scheduled`);
   console.log('='.repeat(70));
+
+  // ── Catch-up: run any jobs that fired while the scheduler was down ────────
+  console.log('');
+  console.log(`Catch-up check (window: ${CATCHUP_WINDOW_MS / 3600000}h):`);
+  for (const job of JOBS) {
+    await checkAndCatchup(job, startTime);
+  }
+  console.log('Catch-up check complete.');
 
   // Graceful shutdown
   const shutdown = (signal) => {

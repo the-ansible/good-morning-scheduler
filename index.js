@@ -666,8 +666,12 @@ async function startScheduler() {
   // ── Catch-up: run any jobs that fired while the scheduler was down ────────
   console.log('');
   console.log(`Catch-up check (window: ${CATCHUP_WINDOW_MS / 3600000}h):`);
-  for (const job of JOBS) {
-    await checkAndCatchup(job, startTime);
+  try {
+    for (const job of JOBS) {
+      await checkAndCatchup(job, startTime);
+    }
+  } catch (err) {
+    console.error('[catchup] Catch-up check threw unexpectedly:', err.message);
   }
   console.log('Catch-up check complete.');
 
@@ -681,10 +685,14 @@ async function startScheduler() {
 
   process.on('SIGINT', () => shutdown('SIGINT'));
   process.on('SIGTERM', () => shutdown('SIGTERM'));
-
-  process.on('unhandledRejection', (reason, promise) => {
-    console.error('Unhandled Rejection:', reason);
-  });
 }
 
-startScheduler();
+// Register unhandledRejection before startup so it covers the entire process lifetime
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('[scheduler] Unhandled Rejection (non-fatal):', reason);
+});
+
+startScheduler().catch(err => {
+  console.error('[scheduler] Fatal startup error:', err);
+  process.exit(1);
+});

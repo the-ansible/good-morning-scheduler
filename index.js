@@ -22,11 +22,11 @@ async function getLauncher() {
 // Slack DM channel for notifications to Chris
 const CHRIS_DM_CHANNEL = 'D0ADRUS0C2V';
 
-// Stimulation server endpoint for composed outbound messages (routes through composer + NATS)
-const STIM_URL = 'http://localhost:3102/api/compose-and-send';
+// Brain server endpoint for composed outbound messages (routes through composer + NATS)
+const STIM_URL = 'http://localhost:3103/api/communication/compose-and-send';
 
 // Notification instruction — appended to prompts that should notify Chris
-// Routes through the stimulation server's composer for voice consistency, then out via NATS → Slack
+// Routes through the brain server's composer for voice consistency, then out via NATS → Slack
 // Includes sender identity so messages are correctly attributed in the knowledge graph
 const SLACK_NOTIFY = `Send your message to Chris using the Bash tool to make an HTTP POST: curl -s -X POST "${STIM_URL}" -H "Content-Type: application/json" -d '{"message": "<YOUR_MESSAGE_HERE>", "sender": {"id": "jane-scheduler", "displayName": "Jane (Scheduler)", "type": "agent"}}'. Replace <YOUR_MESSAGE_HERE> with your actual message text (escape any quotes properly for JSON).`;
 
@@ -309,10 +309,10 @@ First, read /agent/INNER_VOICE.md to remember who you are. Read /agent/operation
 Then, reflect on today. Look at what happened across ALL activity sources:
 
 1. **Claude Code sessions** — The primary source of work. List recent JSONL files in /home/node/.claude/projects/-agent/ sorted by modification time. Read the most recently modified ones from today (check mtime, not filename). These contain the actual coding work, debugging sessions, and conversations.
-2. **Stimulation server sessions** — Conversations and pipeline runs. Check /agent/data/sessions/ for today's JSONL files. These are the Slack conversations routed through the pipeline.
+2. **Communication sessions** — Conversations and pipeline runs. Check /agent/data/sessions/ for today's JSONL files. These are the Slack conversations routed through the pipeline.
 3. **Execution logs** — Check /agent/command/results/ for scheduled job outputs from today.
 4. **Audit and operations logs** — Check /agent/operations/ for any scripts that ran today (look for today's date in filenames or recent mtimes).
-5. **Stimulation server pipeline runs** — Hit GET http://localhost:3102/api/pipeline-runs?limit=20 to see today's pipeline activity (classifications, routing, outcomes).
+5. **Communication pipeline runs** — Hit GET http://localhost:3103/api/communication/pipeline/runs?limit=20 to see today's pipeline activity (routing, outcomes).
 6. **PM2 logs** — Check recent PM2 log output for any service errors or notable events: run "pm2 logs --lines 50 --nostream" to get a tail of recent logs.
 
 Synthesize across all these sources. Don't just look at one. The Claude Code sessions are where most deep work happens — don't skip them.
@@ -369,7 +369,9 @@ Clean up old execution logs to manage storage growth.
     model: 'haiku',
     prompt: `${HEADLESS_PREAMBLE}
 
-Sync modified memory files to the Obsidian vault. This is a mechanical file copy task.
+Sync modified memory files to the Obsidian vault, then ingest new audit files into Graphiti.
+
+**Part 1 — Memory file sync (mechanical file copy)**
 
 1. Read /agent/data/vault/Projects/jane-core/vault-sync-state.json to get lastRunAt timestamp
 2. List the memory files in /home/node/.claude/projects/-agent/memory/ using the Glob tool (pattern: /home/node/.claude/projects/-agent/memory/*.md)
@@ -378,7 +380,13 @@ Sync modified memory files to the Obsidian vault. This is a mechanical file copy
 5. Update /agent/data/vault/Projects/jane-core/vault-sync-state.json with:
    { "lastRunAt": "<current UTC ISO timestamp>", "lastSyncedFiles": [<list of filenames that were copied>], "note": "Incremental sync — only files modified since lastRunAt are processed on subsequent runs" }
    If no files were modified, still update lastRunAt but set lastSyncedFiles to [].
-6. No Slack notification needed unless an error occurs.`,
+
+**Part 2 — Audit ingestion into Graphiti**
+
+6. Run the audit ingestion script: bash -c "node /agent/operations/scripts/ingest-audits-to-graphiti.mjs 2>&1"
+   This script reads all .md files in /agent/operations/ and POSTs any not yet ingested to Graphiti (http://localhost:3200/episodes) with group_id='jane-audits'. It tracks state in vault-sync-state.json and is safe to re-run (skips already-ingested files).
+7. If the script reports any failures, note them — they will be retried automatically on the next run.
+8. No Slack notification needed unless a critical error occurs (e.g., Graphiti down entirely).`,
     description: 'Nightly sync of memory files to vault',
   },
   {
@@ -422,7 +430,7 @@ First, read /agent/data/vault/Blog Drafts/BLOG-DRAFT-PROCESS.md for full context
 3. **Notify Chris separately for each draft** — After writing all three, send a separate Slack message for each one. Use the raw send endpoint so messages go out immediately without composer delay:
 
    For EACH article, make this HTTP call (one at a time, three total):
-   curl -s -X POST "http://localhost:3102/api/send" -H "Content-Type: application/json" -d '{"message": "Blog draft ready: *<TITLE>*\\n\\nOpen in Obsidian: obsidian://open?vault=jane&file=Blog%20Drafts%2F<URL-ENCODED-FILENAME>\\n\\nProcess doc (if you need context on workflow): obsidian://open?vault=jane&file=Blog%20Drafts%2FBLOG-DRAFT-PROCESS.md\\n\\nEdit the markdown, then reply here when ready to publish.", "sender": {"id": "jane-scheduler", "displayName": "Jane", "type": "agent"}}'
+   curl -s -X POST "http://localhost:3103/api/communication/send" -H "Content-Type: application/json" -d '{"message": "Blog draft ready: *<TITLE>*\\n\\nOpen in Obsidian: obsidian://open?vault=jane&file=Blog%20Drafts%2F<URL-ENCODED-FILENAME>\\n\\nProcess doc (if you need context on workflow): obsidian://open?vault=jane&file=Blog%20Drafts%2FBLOG-DRAFT-PROCESS.md\\n\\nEdit the markdown, then reply here when ready to publish.", "sender": {"id": "jane-scheduler", "displayName": "Jane", "type": "agent"}}'
 
    URL-encode the filename (spaces → %20, apostrophes → %27). Send all three messages — one per article, not combined.`,
     description: 'Weekly blog draft generation — 3 articles, one Slack message each (Monday 6 AM Pacific)',

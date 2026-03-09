@@ -1,6 +1,6 @@
 {
   "name": "good-morning-auto-scheduler",
-  "version": "1.1.2",
+  "version": "1.2.0",
   "description": "Self-contained Node.js scheduled task that sends a 'Good morning' message at 8:00 AM Pacific Time daily",
   "main": "dist/index.js",
   "scripts": {
@@ -9,7 +9,6 @@
     "test:run": "exit 0"
   },
   "dependencies": {
-    "@jane-core/claude-launcher": "file:../../packages/claude-launcher",
     "node-cron": "^3.0.3"
   },
   "author": "Jane Assistant",

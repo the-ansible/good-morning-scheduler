@@ -12,15 +12,8 @@ const TIMEZONE = 'America/Los_Angeles';
 // one level up so status files persist across builds/deploys.
 const STATUS_DIR = path.resolve(__dirname, '..', 'status');
 
-// Dynamic import for ESM launcher module (loaded once at first use)
-let _launchClaude = null;
-async function getLauncher() {
-  if (!_launchClaude) {
-    const mod = await import('@jane-core/claude-launcher');
-    _launchClaude = mod.launchClaude;
-  }
-  return _launchClaude;
-}
+// Brain server endpoint for agent job submission (routes through launchAgent())
+const BRAIN_URL = 'http://localhost:3103';
 
 // Slack DM channel for notifications to Chris
 const CHRIS_DM_CHANNEL = 'D0ADRUS0C2V';
@@ -523,10 +516,10 @@ async function executeJob(job) {
     timestamp: now.toISOString(),
     timestampPacific: timestamp,
     model: job.model,
-    success: false,
+    status: 'pending',
+    jobId: null,
+    sessionId: null,
     error: null,
-    exitCode: null,
-    durationMs: null,
   };
 
   const startTs = now.toISOString();
@@ -538,82 +531,72 @@ async function executeJob(job) {
     formatGraphitiEpisode({
       who: `Jane (good-morning-scheduler / ${job.name})`,
       what: `Scheduled job "${job.name}" started. ${job.description}`,
-      where: 'good-morning-scheduler / Claude CLI subprocess',
+      where: 'good-morning-scheduler → brain-server launchAgent()',
       when: startTs,
       why: `Cron schedule "${job.schedule}" (${scheduleDesc}) triggered autonomous task`,
-      how: `Claude ${job.model} model, direct subprocess spawn via claude --print --dangerously-skip-permissions`,
+      how: `Claude ${job.model} model via brain server launchAgent() HTTP API at ${BRAIN_URL}/api/jobs`,
     }),
     `Jane's scheduler started the "${job.name}" job`,
     startTs,
   ).catch(() => {});
 
-  const startTime = Date.now();
-
   try {
-    const launchClaude = await getLauncher();
-    let stderrBuf = '';
+    // Submit job to brain server via launchAgent() HTTP API.
+    // The brain server tracks all agent jobs centrally, injects context (system-state,
+    // memories, goal-history), and manages process lifecycle.
+    const controller = new AbortController();
+    const submitTimeout = setTimeout(() => controller.abort(), 30_000);
 
-    const result = await launchClaude({
-      model: job.model,
-      prompt: job.prompt,
-      promptVia: 'arg',
-      outputFormat: 'text',
-      timeout: 60 * 60 * 1000, // 1 hour
-      additionalArgs: ['--no-session-persistence'],
-      onStderr: (chunk) => { stderrBuf += chunk; },
+    const response = await fetch(`${BRAIN_URL}/api/jobs`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        prompt: job.prompt,
+        type: 'task',
+        role: 'executor',
+        runtime: { tool: 'claude-code', model: job.model },
+      }),
+      signal: controller.signal,
     });
+    clearTimeout(submitTimeout);
 
-    const durationMs = Date.now() - startTime;
-    const durationStr = `${(durationMs / 1000).toFixed(1)}s`;
-
-    statusResult.exitCode = result.exitCode;
-    statusResult.durationMs = durationMs;
-    statusResult.success = result.exitCode === 0;
-
-    // Truncate output for status file (keep last 2000 chars)
-    if (result.stdout) {
-      statusResult.outputTail = result.stdout.slice(-2000);
-    }
-    if (stderrBuf) {
-      statusResult.stderrTail = stderrBuf.slice(-1000);
+    if (!response.ok) {
+      const errText = await response.text().catch(() => '');
+      throw new Error(`Brain server returned ${response.status}: ${errText.slice(0, 200)}`);
     }
 
-    if (result.exitCode === 0) {
-      console.log(`[${timestamp}] ✓ ${job.name} completed (${durationStr})`);
-    } else {
-      console.error(`[${timestamp}] ✗ ${job.name} failed with exit code ${result.exitCode} (${durationStr})`);
-      if (stderrBuf) {
-        console.error(`[${timestamp}]   stderr: ${stderrBuf.slice(-500)}`);
-      }
-    }
+    const data = await response.json();
+    statusResult.jobId = data.jobId;
+    statusResult.sessionId = data.sessionId;
+    statusResult.status = 'submitted';
+
+    console.log(`[${timestamp}] ✓ ${job.name} submitted (jobId: ${data.jobId})`);
   } catch (error) {
-    const durationMs = Date.now() - startTime;
-    statusResult.durationMs = durationMs;
     statusResult.error = error.message;
+    statusResult.status = 'error';
     console.error(`[${timestamp}] ✗ ${job.name}: ${error.message}`);
   }
 
   await writeJobStatus(job.name, statusResult);
 
-  // Ingest job-completion episode into Graphiti (fire-and-forget)
-  const completedTs = new Date().toISOString();
-  const durationSec = statusResult.durationMs ? `${(statusResult.durationMs / 1000).toFixed(1)}s` : 'unknown';
+  // Ingest job-submission episode into Graphiti (fire-and-forget)
+  const submittedTs = new Date().toISOString();
   const outcome = statusResult.error
-    ? `errored: ${statusResult.error}`
-    : statusResult.success ? 'completed successfully' : `failed (exit code ${statusResult.exitCode})`;
+    ? `submission failed: ${statusResult.error}`
+    : `submitted to brain server (jobId: ${statusResult.jobId})`;
 
   ingestSchedulerEpisode(
-    `scheduler-done-${job.name}-${startTs}`,
+    `scheduler-submitted-${job.name}-${startTs}`,
     formatGraphitiEpisode({
       who: `Jane (good-morning-scheduler / ${job.name})`,
       what: `Scheduled job "${job.name}" ${outcome}. ${job.description}`,
-      where: 'good-morning-scheduler / Claude CLI subprocess',
-      when: completedTs,
+      where: 'good-morning-scheduler → brain-server launchAgent()',
+      when: submittedTs,
       why: `Cron schedule "${job.schedule}" (${scheduleDesc}) — autonomous maintenance task`,
-      how: `Claude ${job.model} model. Duration: ${durationSec}. Exit code: ${statusResult.exitCode ?? 'N/A'}`,
+      how: `Claude ${job.model} model via brain server executor. Job tracked at GET ${BRAIN_URL}/api/jobs/${statusResult.jobId ?? 'N/A'}`,
     }),
-    `Jane's scheduler completed the "${job.name}" job (${statusResult.success ? 'success' : 'failure'})`,
-    completedTs,
+    `Jane's scheduler submitted the "${job.name}" job to brain server`,
+    submittedTs,
   ).catch(() => {});
 }
 
@@ -643,11 +626,11 @@ async function startScheduler() {
   });
 
   console.log('='.repeat(70));
-  console.log('Jane Task Scheduler (direct Claude execution)');
+  console.log('Jane Task Scheduler (brain server executor)');
   console.log('='.repeat(70));
   console.log(`Started: ${startTimePacific}`);
   console.log(`Timezone: ${TIMEZONE}`);
-  console.log(`Claude: @jane-core/claude-launcher`);
+  console.log(`Brain: ${BRAIN_URL}/api/jobs`);
   console.log('');
   console.log('Scheduled Jobs:');
   console.log('-'.repeat(70));

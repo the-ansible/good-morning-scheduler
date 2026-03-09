@@ -7,7 +7,10 @@ const path = require('path');
 // ─── Configuration ───────────────────────────────────────────────────────────
 
 const TIMEZONE = 'America/Los_Angeles';
-const STATUS_DIR = path.join(__dirname, 'status');
+// Status files are stored at the app root level, not inside dist/.
+// When running from dist/index.js, __dirname is <app>/dist/ — we resolve
+// one level up so status files persist across builds/deploys.
+const STATUS_DIR = path.resolve(__dirname, '..', 'status');
 
 // Dynamic import for ESM launcher module (loaded once at first use)
 let _launchClaude = null;

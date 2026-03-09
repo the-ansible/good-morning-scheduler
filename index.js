@@ -7,7 +7,10 @@ const path = require('path');
 // ─── Configuration ───────────────────────────────────────────────────────────
 
 const TIMEZONE = 'America/Los_Angeles';
-const STATUS_DIR = path.join(__dirname, 'status');
+// Status files are stored at the app root level, not inside dist/.
+// When running from dist/index.js, __dirname is <app>/dist/ — we resolve
+// one level up so status files persist across builds/deploys.
+const STATUS_DIR = path.resolve(__dirname, '..', 'status');
 
 // Dynamic import for ESM launcher module (loaded once at first use)
 let _launchClaude = null;
@@ -666,8 +669,12 @@ async function startScheduler() {
   // ── Catch-up: run any jobs that fired while the scheduler was down ────────
   console.log('');
   console.log(`Catch-up check (window: ${CATCHUP_WINDOW_MS / 3600000}h):`);
-  for (const job of JOBS) {
-    await checkAndCatchup(job, startTime);
+  try {
+    for (const job of JOBS) {
+      await checkAndCatchup(job, startTime);
+    }
+  } catch (err) {
+    console.error('[catchup] Catch-up check threw unexpectedly:', err.message);
   }
   console.log('Catch-up check complete.');
 
@@ -681,10 +688,14 @@ async function startScheduler() {
 
   process.on('SIGINT', () => shutdown('SIGINT'));
   process.on('SIGTERM', () => shutdown('SIGTERM'));
-
-  process.on('unhandledRejection', (reason, promise) => {
-    console.error('Unhandled Rejection:', reason);
-  });
 }
 
-startScheduler();
+// Register unhandledRejection before startup so it covers the entire process lifetime
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('[scheduler] Unhandled Rejection (non-fatal):', reason);
+});
+
+startScheduler().catch(err => {
+  console.error('[scheduler] Fatal startup error:', err);
+  process.exit(1);
+});
